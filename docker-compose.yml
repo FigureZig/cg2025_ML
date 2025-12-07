@@ -1,0 +1,33 @@
+version: '3.8'
+
+services:
+  api:
+    build: .
+    container_name: finance_backend
+    restart: always
+    # ports:  <-- УБИРАЕМ (или комментим), чтобы api не торчал наружу
+    #   - "8000:8000"
+    expose:
+      - "8000" # Открываем только внутри сети докера для Caddy
+    volumes:
+      - ./data:/app/data
+      - ./app/ml/artifacts:/app/app/ml/artifacts
+    environment:
+      - DATABASE_URL=sqlite+aiosqlite:////app/data/finance.db
+
+  caddy:
+    image: caddy:latest
+    restart: always
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - api
+
+volumes:
+  caddy_data:
+  caddy_config:
