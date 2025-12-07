@@ -8,6 +8,7 @@ from app.core.database import get_db
 from app.schemas.transaction import TransactionCreate, TransactionResponse, TransactionUpdateCategory
 from app.schemas.advisory import AdvisoryResponse, GoalRequest
 from app.schemas.budget import BudgetSet, BudgetResponse
+from app.schemas.analytics import FinancialHealthResponse
 from app.services.finance import FinanceService
 from app.ml.engine import ml_engine
 from app.config import settings
@@ -112,6 +113,11 @@ async def get_analytics_summary(
 @api_router.get("/analytics/monthly", tags=["Analytics"])
 async def get_monthly_analytics(db: AsyncSession = Depends(get_db)):
     return await FinanceService.get_monthly_stats(db)
+
+
+@api_router.get("/analytics/health", response_model=FinancialHealthResponse, tags=["Analytics"])
+async def get_health_score(db: AsyncSession = Depends(get_db)):
+    return await FinanceService.calculate_financial_health_score(db)
 
 
 @api_router.get("/categories", tags=["System"])

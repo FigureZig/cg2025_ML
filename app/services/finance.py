@@ -7,6 +7,7 @@ from app.models.transaction import Transaction, Budget
 from app.ml.engine import ml_engine
 from app.schemas.transaction import TransactionUpdateCategory, TransactionResponse
 from app.schemas.budget import BudgetResponse
+from app.schemas.analytics import FinancialHealthResponse
 from app.config import settings
 
 
@@ -20,16 +21,13 @@ class FinanceService:
         if not trx_data.get('trx_date'):
             trx_data['trx_date'] = FinanceService.get_system_time()
 
-        # 1. ML Predict
         prediction = ml_engine.predict_transaction(trx_data)
         category = prediction["category"]
 
-        # 2. Limit Check Logic
         warning_msg = None
         if trx_data['type'] == 'withdrawal':
             current_month_start = trx_data['trx_date'].replace(day=1, hour=0, minute=0, second=0, microsecond=0)
 
-            # Sum spent in this category for current month
             spent_query = select(func.sum(Transaction.amount)).where(
                 and_(
                     Transaction.category == category,
@@ -40,7 +38,6 @@ class FinanceService:
             spent_res = await db.execute(spent_query)
             already_spent = spent_res.scalar() or 0.0
 
-            # Get Budget
             limit_query = select(Budget).where(Budget.category == category)
             limit_res = await db.execute(limit_query)
             budget = limit_res.scalar_one_or_none()
@@ -52,7 +49,6 @@ class FinanceService:
                 elif total_projected > (budget.amount_limit * 0.9):
                     warning_msg = f"Внимание: исчерпано 90% лимита ({total_projected:.0f} / {budget.amount_limit:.0f})"
 
-        # 3. Create DB Object
         db_obj = Transaction(
             amount=trx_data['amount'],
             type=trx_data['type'],
@@ -68,7 +64,6 @@ class FinanceService:
         await db.commit()
         await db.refresh(db_obj)
 
-        # 4. Construct Response manually to inject warning
         return TransactionResponse(
             id=db_obj.id,
             amount=db_obj.amount,
@@ -89,7 +84,6 @@ class FinanceService:
         now = FinanceService.get_system_time()
         month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
 
-        # Get all distinct categories
         cats_query = select(Transaction.category).distinct()
         cats_res = await db.execute(cats_query)
         active_cats = set(r for r in cats_res.scalars().all())
@@ -98,13 +92,11 @@ class FinanceService:
 
         result = []
         for cat in all_cats:
-            # Get limit
             b_query = select(Budget).where(Budget.category == cat)
             b_res = await db.execute(b_query)
             budget = b_res.scalar_one_or_none()
             limit = budget.amount_limit if budget else 0.0
 
-            # Get spent
             s_query = select(func.sum(Transaction.amount)).where(
                 and_(
                     Transaction.category == cat,
@@ -176,6 +168,116 @@ class FinanceService:
         )
 
     @staticmethod
+    async def calculate_financial_health_score(db: AsyncSession) -> FinancialHealthResponse:
+        now = FinanceService.get_system_time()
+        start_30d = now - timedelta(days=30)
+        start_90d = now - timedelta(days=90)
+
+        cf_query = select(
+            func.sum(case((Transaction.type == 'withdrawal', Transaction.amount), else_=0)),
+            func.sum(case((Transaction.type == 'deposit', Transaction.amount), else_=0))
+        ).where(and_(Transaction.trx_date >= start_30d, Transaction.trx_date <= now))
+
+        cf_res = await db.execute(cf_query)
+        expenses_30d, income_30d = cf_res.one()
+        expenses_30d = expenses_30d or 0.0
+        income_30d = income_30d or 0.0
+
+        avg_exp_query = select(func.sum(Transaction.amount)).where(
+            and_(Transaction.type == 'withdrawal', Transaction.trx_date >= start_90d)
+        )
+        avg_res = await db.execute(avg_exp_query)
+        total_exp_90d = avg_res.scalar() or 0.0
+        monthly_avg_burn = total_exp_90d / 3.0 if total_exp_90d > 0 else expenses_30d
+
+        last_trx_q = select(Transaction.balance_after).order_by(desc(Transaction.trx_date), desc(Transaction.id)).limit(
+            1)
+        bal_res = await db.execute(last_trx_q)
+        current_balance = bal_res.scalar_one_or_none() or 0.0
+
+        score_accum = 0
+
+        # 1. Statistics (Max 70)
+        # Cashflow (Max 30)
+        if income_30d > 0:
+            savings_rate = (income_30d - expenses_30d) / income_30d
+            if savings_rate >= 0.2:
+                score_accum += 30
+            elif savings_rate >= 0.1:
+                score_accum += 20
+            elif savings_rate >= 0:
+                score_accum += 10
+
+        # Runway (Max 20)
+        if monthly_avg_burn > 0:
+            runway = current_balance / monthly_avg_burn
+            if runway >= 3:
+                score_accum += 20
+            elif runway >= 1:
+                score_accum += 10
+
+        # Limits (Max 20)
+        budgets_q = select(Budget)
+        b_res = await db.execute(budgets_q)
+        budgets = b_res.scalars().all()
+
+        limits_ok = True
+        month_start = now.replace(day=1, hour=0, minute=0, second=0)
+
+        for b in budgets:
+            c_q = select(func.sum(Transaction.amount)).where(
+                and_(Transaction.category == b.category, Transaction.type == 'withdrawal',
+                     Transaction.trx_date >= month_start)
+            )
+            c_r = await db.execute(c_q)
+            c_s = c_r.scalar() or 0.0
+            if b.amount_limit > 0 and c_s > b.amount_limit:
+                limits_ok = False
+                break
+
+        if limits_ok:
+            score_accum += 20
+        else:
+            score_accum += 5
+
+            # 2. ML Forecast (Max 30)
+        df = await FinanceService.get_full_history_df(db)
+        if not df.empty and len(df) > 5:
+            try:
+                # Run simulation for 30 days without specific goals
+                strategy = ml_engine.generate_strategy(df, goals=None, current_date=now)
+
+                if strategy and "simulation" in strategy:
+                    graph = strategy["simulation"].get("graph", [])
+                    if graph and len(graph) > 1:
+                        start_bal = graph[0]["balance"]
+                        end_bal = graph[-1]["balance"]
+
+                        if end_bal < 0:
+                            score_accum -= 20
+                        elif end_bal > start_bal * 1.02:
+                            score_accum += 30
+                        elif end_bal >= start_bal * 0.95:
+                            score_accum += 15
+                        else:
+                            score_accum += 0
+            except:
+                pass
+
+        final_score = max(0, min(100, score_accum))
+
+        if final_score >= 80:
+            status = "Excellent"
+        elif final_score >= 50:
+            status = "Good"
+        elif final_score >= 30:
+            status = "Warning"
+        else:
+            status = "Critical"
+
+        return FinancialHealthResponse(score=final_score, status=status)
+
+    @staticmethod
     async def get_history(db: AsyncSession, skip: int = 0, limit: int = 50):
         current_time = FinanceService.get_system_time()
         query = (
@@ -191,7 +293,6 @@ class FinanceService:
     @staticmethod
     async def get_current_balance(db: AsyncSession):
         current_time = FinanceService.get_system_time()
-        # Find last transaction to get cumulative balance
         query = (
             select(Transaction)
             .where(Transaction.trx_date <= current_time)
