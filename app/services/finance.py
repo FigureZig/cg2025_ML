@@ -428,7 +428,11 @@ class FinanceService:
         await db.execute(delete(Transaction))
         await db.execute(delete(Budget))
         await db.commit()
-        return {"status": "cleared", "timestamp": FinanceService.get_system_time()}
+
+        from app.core.seed import seed_data
+        await seed_data(db)
+
+        return {"status": "soft_reset_completed", "timestamp": FinanceService.get_system_time()}
 
     @staticmethod
     async def generate_strategy(db: AsyncSession, goals: list):
