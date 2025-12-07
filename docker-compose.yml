@@ -5,8 +5,8 @@ services:
     build: .
     container_name: finance_backend
     restart: always
-    # ports:  <-- УБИРАЕМ (или комментим), чтобы api не торчал наружу
-    #   - "8000:8000"
+    ports:
+      - "8000:8000"
     expose:
       - "8000" # Открываем только внутри сети докера для Caddy
     volumes:

@@ -23,6 +23,8 @@ class Transaction(Base):
     original_category = Column(String, nullable=True)
     is_manual = Column(Boolean, default=False)
 
+    is_read = Column(Boolean, default=False, index=True)
+
 
 class Budget(Base):
     __tablename__ = "budgets"

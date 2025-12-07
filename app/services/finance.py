@@ -5,6 +5,7 @@ from datetime import datetime, timedelta
 
 from app.models.transaction import Transaction, Budget
 from app.ml.engine import ml_engine
+from app.schemas.notification import AnomalyListResponse, AnomalyItem
 from app.schemas.transaction import TransactionUpdateCategory, TransactionResponse
 from app.schemas.budget import BudgetResponse
 from app.schemas.analytics import FinancialHealthResponse
@@ -452,3 +453,106 @@ class FinanceService:
         if "_sa_instance_state" in df.columns:
             del df["_sa_instance_state"]
         return df
+
+    @staticmethod
+    def _generate_compliance_text(trx: Transaction) -> tuple[str, str]:
+        raw_reason = (trx.anomaly_reason or "").lower()
+        import re
+
+        ratio_match = re.search(r'x(\d+\.?\d*)', raw_reason)
+        times = ratio_match.group(1) if ratio_match else "несколько"
+
+        amount_str = f"{int(trx.amount):,} ₽".replace(",", " ")
+
+        if "поступлений" in raw_reason:
+            return (
+                "Резкие траты после пополнения",
+                f"Вы начали активно тратить сразу после зачисления денег. Расходы в {times} раз выше обычного. Убедитесь, что это запланированные покупки."
+            )
+
+        if "новая крупная" in raw_reason:
+            return (
+                f"Необычная покупка в '{trx.category}'",
+                f"Мы заметили операцию на {amount_str}. Раньше вы не тратили так много в этой категории. Это точно вы?"
+            )
+
+        if "значительная сумма" in raw_reason or "large amount" in raw_reason:
+            return (
+                "Крупное списание",
+                f"Сумма {amount_str} выбивается из вашей обычной истории трат. Обратите внимание."
+            )
+
+        if "интенсивность" in raw_reason or "активность" in raw_reason:
+            return (
+                "Вы тратите быстрее обычного",
+                f"Скорость расходов выросла в {times} раз по сравнению с вашей нормой. Возможно, стоит притормозить?"
+            )
+
+        if trx.trx_date.hour < 6 and not (trx.trx_date.hour == 0 and trx.trx_date.minute == 0):
+            return (
+                "Ночная активность",
+                f"Операция на {amount_str} проведена ночью. Если это не вы — срочно заблокируйте карту."
+            )
+
+        return (
+            "Нетипичная операция",
+            f"Эта транзакция в категории '{trx.category}' не похожа на ваши обычные траты. Проверьте детали."
+        )
+
+    @staticmethod
+    async def get_anomaly_feed(db: AsyncSession, limit: int = 50, offset: int = 0) -> AnomalyListResponse:
+        count_query = select(func.count(Transaction.id)).where(Transaction.is_anomaly == True)
+        unread_query = select(func.count(Transaction.id)).where(
+            and_(Transaction.is_anomaly == True, Transaction.is_read == False)
+        )
+
+        total_res = await db.execute(count_query)
+        unread_res = await db.execute(unread_query)
+
+        total_count = total_res.scalar() or 0
+        unread_count = unread_res.scalar() or 0
+
+        data_query = (
+            select(Transaction)
+            .where(Transaction.is_anomaly == True)
+            .order_by(Transaction.is_read.asc(), desc(Transaction.trx_date))
+            .offset(offset)
+            .limit(limit)
+        )
+        result = await db.execute(data_query)
+        rows = result.scalars().all()
+
+        items = []
+        for row in rows:
+            title, desc_text = FinanceService._generate_compliance_text(row)
+            items.append(AnomalyItem(
+                id=row.id,
+                date=row.trx_date,
+                amount=row.amount,
+                category=row.category,
+                title=title,
+                description=desc_text,
+                is_read=row.is_read
+            ))
+
+        return AnomalyListResponse(
+            total_count=total_count,
+            unread_count=unread_count,
+            items=items
+        )
+
+    @staticmethod
+    async def mark_anomaly_status(db: AsyncSession, anomaly_id: int, is_read: bool):
+        query = select(Transaction).where(
+            and_(Transaction.id == anomaly_id, Transaction.is_anomaly == True)
+        )
+        result = await db.execute(query)
+        trx = result.scalar_one_or_none()
+
+        if not trx:
+            return None
+
+        trx.is_read = is_read
+        await db.commit()
+        await db.refresh(trx)
+        return trx

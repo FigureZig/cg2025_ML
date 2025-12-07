@@ -9,6 +9,7 @@ from app.schemas.transaction import TransactionCreate, TransactionResponse, Tran
 from app.schemas.advisory import AdvisoryResponse, GoalRequest
 from app.schemas.budget import BudgetSet, BudgetResponse
 from app.schemas.analytics import FinancialHealthResponse
+from app.schemas.notification import AnomalyListResponse, AnomalyReadRequest
 from app.services.finance import FinanceService
 from app.ml.engine import ml_engine
 from app.config import settings
@@ -128,3 +129,22 @@ async def get_categories(db: AsyncSession = Depends(get_db)):
 @api_router.delete("/reset", tags=["System"])
 async def hard_reset(db: AsyncSession = Depends(get_db)):
     return await FinanceService.hard_reset(db)
+
+@api_router.get("/anomalies", response_model=AnomalyListResponse, tags=["Security"])
+async def get_anomalies(
+    skip: int = 0,
+    limit: int = 20,
+    db: AsyncSession = Depends(get_db)
+):
+    return await FinanceService.get_anomaly_feed(db, limit, skip)
+
+@api_router.patch("/anomalies/{anomaly_id}/status", tags=["Security"])
+async def set_anomaly_status(
+    anomaly_id: int,
+    body: AnomalyReadRequest,
+    db: AsyncSession = Depends(get_db)
+):
+    res = await FinanceService.mark_anomaly_status(db, anomaly_id, body.is_read)
+    if not res:
+        raise HTTPException(status_code=404, detail="Anomaly not found")
+    return {"status": "updated", "id": anomaly_id, "is_read": body.is_read}
